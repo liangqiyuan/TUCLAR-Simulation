@@ -1,5 +1,6 @@
 import heapq
 
+
 class Action:
     def __init__(self, name, preconditions, add_effects, del_effects):
         self.name = name
@@ -36,7 +37,7 @@ class AStarPlanner:
         visited = {start_state: 0}
 
         while pq:
-            priority, cost, state, path = heapq.heappop(pq)
+            _priority, cost, state, path = heapq.heappop(pq)
 
             # Goal check: all goal variables must be true in the state
             if goal_state.issubset(state):

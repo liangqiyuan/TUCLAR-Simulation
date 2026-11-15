@@ -11,8 +11,8 @@ import time
 
 import contextily as ctx
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.lines import Line2D
+from matplotlib.patches import Polygon as MplPolygon
 
 import agent as agent_mod
 import find_optimal
@@ -354,7 +354,7 @@ def agent_worker(sim, response_queue, render_done=None):
 
 if __name__ == "__main__":
     session = time.strftime("%Y%m%d_%H%M%S")
-    for i in range(10):
+    for i in range(35):
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:

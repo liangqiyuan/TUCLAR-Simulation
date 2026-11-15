@@ -1,18 +1,17 @@
 """Per-agent HTN planners. Each drone owns one planner and its own wall-clock budget.
 
-Backends:
-  RuleHTNPlanner  deterministic role-assignment rules, no LLM calls
-  RulePlanner   Non-HTN planner
-
 Each drone has one planner; details from planners are not shared with each other.
 Planners are deterministic, and will be consistent between drones.
 """
+import heapq
+import itertools
+import math
 import time
+from collections import Counter
 
-import numpy as np
+from environment import REQUIRED_DRONES
 
-from environment import TargetType
-
+UNKNOWN_SLOT_GUESS = 1
 
 class PlanningBudgetExceeded(Exception):
     pass
@@ -36,162 +35,170 @@ class _BudgetedPlanner:
         if remaining <= 0:
             raise PlanningBudgetExceeded(f"over {self.time_budget:.1f}s budget")
         return remaining
-
-
-class Area:
-
-    # targets: a list of TargetLocations (from environment.py)
-    def __init__(self, targets):
-        
-        if len(targets) == 1:
-            self.singular = True
-        else:
-            self.singular = False
-
-        self.targets = targets
-        
-        # A list of sub-areas within the area.
-        self.areas = []
-
-
-class RuleHTNPlanner(_BudgetedPlanner):
-    def plan(self, agent_index, num_agents, environment):
-        self._remaining()
-
-        if all (target.visited for target in environment.get_target_locations()):
-            return "RECALL", None
-
-        total_area = Area(environment.get_target_locations())
-
-        self.divide(total_area)
-
-        # TODO: Assign tasks to drones
-
-        # Keep track of how many agents must visit an area
-            # A0,0: one
-            # A0,1: two
-            # A0: two
-
-
     
+    def _start_round(self):
+        """Restart this drone's clock; call at the top of each plan()."""
+        self.started_at = time.perf_counter()
 
-    
-    # Planning on making a more advanced version of divide_half below.
-    def divide(self, area):
-        if area.singular:
-            return
+class Action:
+    def __init__(self, name, preconditions, add_effects, del_effects, cost=1.0):
+        self.name = name
+        self.preconditions = set(preconditions)
+        self.add_effects = set(add_effects)
+        self.del_effects = set(del_effects)
+        self.cost = cost
 
-        # TODO: Decide how to subdivide areas, then subdivide areas and add into area.areas
+    def is_applicable(self, state):
+        return self.preconditions.issubset(state)
 
-        for subarea in area.areas:
-            self.divide(subarea)
+    def apply(self, state):
+        return (state - self.del_effects) | self.add_effects
 
-    # Splits the given area, with an equal number of targets in each half.
-    # Tries to optimize such that the center of each half is as far apart as possible
-    # Recurses until there is one target in the area.
-    def divide_half(self, area):
-        if area.singular:
-            return
+    def __repr__(self):
+        return f"Action({self.name})"
 
-        pts = np.array([t.get_location() for t in area.targets], dtype=float)
-        n = len(pts)
-        k = n // 2  # sizes are k and n - k (equal when n is even)
 
-        # Start from the principal axis plus a few random directions.
-        centered = pts - pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        rng = np.random.default_rng(0)
-        starts = [vt[0]] + list(rng.normal(size=(8, 3)))
+class AStarPlanner:
+    def __init__(self, actions, check_budget=None):
+        self.actions = actions
+        self.check_budget = check_budget   # called once per expanded node; may raise
+        self._unit = 0.0
 
-        best_dist = -1.0
-        best_split = None
+    def heuristic(self, state, goal):
+        # Each unmet goal fact needs its own achiever action (assumes an action adds at most
+        # one goal fact), so the cheapest achiever's cost is an admissible per-fact bound.
+        return self._unit * len(goal - state)
 
-        for u in starts:
-            prev_key = None
-            while True:
-                # For a fixed direction u, the best split puts the k points
-                # with the largest projection on u in one group.
-                order = np.argsort(-(pts @ u), kind="stable")
-                idx_a, idx_b = order[:k], order[k:]
-                diff = pts[idx_a].mean(axis=0) - pts[idx_b].mean(axis=0)
-                dist = np.linalg.norm(diff)
+    def solve(self, initial_state, goal_state):
+        start, goal = frozenset(initial_state), frozenset(goal_state)
+        self._unit = min((a.cost for a in self.actions if a.add_effects & goal), default=0.0)
 
-                if dist > best_dist:
-                    best_dist = dist
-                    best_split = (idx_a.copy(), idx_b.copy())
+        tie = itertools.count()   # unique tiebreaker: states and paths are never compared
+        pq = [(self.heuristic(start, goal), 0.0, next(tie), start, [])]
+        best = {start: 0.0}
 
-                key = tuple(sorted(idx_a.tolist()))
-                if key == prev_key or dist == 0:
-                    break
-                prev_key = key
-                u = diff  # re-aim at the current mean-to-mean direction
+        while pq:
+            _, cost, _, state, path = heapq.heappop(pq)
+            if self.check_budget:
+                self.check_budget()
+            if goal <= state:
+                return path
+            if cost > best.get(state, math.inf):
+                continue   # stale entry; a cheaper route to this state was found later
+            for action in self.actions:
+                if action.is_applicable(state):
+                    nxt = action.apply(state)
+                    new_cost = cost + action.cost
+                    if new_cost < best.get(nxt, math.inf):
+                        best[nxt] = new_cost
+                        heapq.heappush(pq, (new_cost + self.heuristic(nxt, goal), new_cost,
+                                            next(tie), nxt, path + [action.name]))
+        return None
 
-        idx_a, idx_b = best_split
-        area.areas = [
-            Area([area.targets[i] for i in idx_a]),
-            Area([area.targets[i] for i in idx_b]),
-        ]
 
-        for subarea in area.areas:
-            self.divide(subarea)
+def build_state(me, predicted_positions):
+    # predicted_positions: dict drone_id -> target it is believed heading to
+    state = {f"at_{me}_cur"}
+    for p, t in predicted_positions.items():
+        if p != me and t is not None:
+            state.add(f"at_{p}_{t}")
+    return state
 
-# ---------------------------------------------------------------------------
-# Rule-based backend
-# ---------------------------------------------------------------------------
-"""
-The following is a non-hierarchical task planner.
 
-The assignments are deterministic based on index and target type, which is 
-publicly available to all agents. 
+def build_goal(open_targets):
+    return {f"served_{t}" for t in open_targets}
 
-Since all geometric details were obfuscated, the HTN planner has too few details
-to work with, and the hierarchy is skin-deep. Details may be re-added in the future.
-"""
 
-class RulePlanner(_BudgetedPlanner):
-    def plan(self, agent_index, num_agents, targets, scene=None):
-        # Works through the targets and decides what a drone ought to do.
-        # Decides what EVERY drone ought to do, but only outputs for one drone
-        # Outputs String & None or String & int.
-        # "RECALL", None
-        # "IDLE", None
-        # "Fly", int
+def build_actions(me, n_drones, open_targets, dist, target_type, visited_by_me):
+    """
+    open_targets:  uncleared targets worth planning for (nodes are 'cur' plus these)
+    dist(a, b):    travel cost in rounds; a, b are 'cur' or a target index
+    target_type:   dict t -> 1, 2, 3, or None (unknown), from this drone's beliefs
+    visited_by_me: targets this drone already visited (for k=3)
+    """
+    nodes = ["cur"] + list(open_targets)
+    partners = [p for p in range(n_drones) if p != me]
+    acts = []
 
-        # Check if too much time has passed
-        self._remaining()
+    for a in nodes:
+        for t in open_targets:
+            if a != t:
+                acts.append(Action(f"go_{me}_{a}_{t}",
+                                   [f"at_{me}_{a}"], [f"at_{me}_{t}"], [f"at_{me}_{a}"],
+                                   cost=dist(a, t)))
 
-        # Check if all targets have been visited
+    for t in open_targets:
+        k = target_type.get(t)
+        here = f"at_{me}_{t}"
+
+        if k is None:
+            acts.append(Action(f"scout_{me}_{t}", [here], [f"served_{t}"], [], cost=0.5))
+        elif k == 1:
+            acts.append(Action(f"clear_{me}_{t}", [here],
+                               [f"served_{t}", f"cleared_{t}"], [], cost=0.5))
+        elif k == 2:
+            # Effects are just served_t for both, so join and hold reach the same state
+            # and A* keeps the cheaper one instead of searching duplicate states.
+            for p in partners:
+                acts.append(Action(f"join_{me}_{p}_{t}", [here, f"at_{p}_{t}"],
+                                   [f"served_{t}"], [], cost=0.5))
+            acts.append(Action(f"hold_{me}_{t}", [here], [f"served_{t}"], [], cost=3.0))
+        elif k == 3 and t not in visited_by_me:
+            acts.append(Action(f"visit_{me}_{t}", [here],
+                               [f"served_{t}", f"visited_{me}_{t}"], [], cost=0.5))
+    return acts
+
+
+class AStarHTNPlanner(_BudgetedPlanner):
+    """Plans a route over every target this drone believes still needs someone, then returns
+    the first leg. Replans each time the drone is prompted, so beliefs stay current."""
+
+    def plan(self, agent_index, num_agents, targets, scene):
+        # scene: location, velocity, teammate_targets, type_known (built by AgentHandler)
+        # Returns ("RECALL", None) | ("IDLE", None) | ("FLY", target_index)
+        self._start_round()
+
         if all(t.visited for t in targets):
             return "RECALL", None
 
-        exclusive_seen = 0
-        sequential_seen = 0
-        joint_seen = 0
-        for idx, target in enumerate(targets):
-            if target.visited:
+        me = agent_index
+        known = scene["type_known"]
+        target_type = {i: (REQUIRED_DRONES[t.target_type] if known(t) else None)
+                       for i, t in enumerate(targets)}
+        visited_by_me = {i for i, t in enumerate(targets) if me in t.visitors}
+
+        # Teammate beliefs: an int is a believed target; None, -1 and "blocked" carry no claim
+        predicted = {p: t for p, t in scene["teammate_targets"].items()
+                     if isinstance(t, int) and t >= 0 and not targets[t].cleared}
+        claims = Counter(predicted.values())
+
+        # Open = uncleared, not a Sequential I already counted toward, not already covered
+        open_targets = []
+        for i, t in enumerate(targets):
+            if t.cleared:
                 continue
-            roles, exclusive_seen, sequential_seen, joint_seen = self._method_for(
-                target, num_agents, exclusive_seen, sequential_seen, joint_seen)
-            if agent_index in roles and not self._already_counted(agent_index, target):
-                return "FLY", idx
-        return "IDLE", None
+            k = target_type[i]
+            if k == 3 and i in visited_by_me:
+                continue
+            need = k if k is not None else UNKNOWN_SLOT_GUESS
+            if claims[i] >= need:
+                continue
+            open_targets.append(i)
+        if not open_targets:
+            return "IDLE", None
 
-    # Using this method, iterating over every target, an agent is assigned to every target.
-    # This method is deterministic based on information available to all agents and it
-    # doesn't matter if it's centralized or decentralized. However, future changes may 
-    # make that distinction matter.
-    @staticmethod
-    def _method_for(target, num_agents, exclusive_seen, sequential_seen, joint_seen):
-        if target.target_type == TargetType.JOINT:
-            return {joint_seen % num_agents, (joint_seen + 1) % num_agents}, exclusive_seen, sequential_seen, joint_seen + 1
-        if target.target_type == TargetType.EXCLUSIVE:
-            return {exclusive_seen % num_agents}, exclusive_seen + 1, sequential_seen, joint_seen
-        roles = {(sequential_seen + s) % num_agents for s in range(3)}
-        return roles, exclusive_seen, sequential_seen + 1, joint_seen
+        pos = {"cur": tuple(scene["location"])}
+        pos.update({i: targets[i].get_location() for i in open_targets})
+        speed = scene["velocity"]
 
-    # Check if an agent has already visited a certain target. Only applicable for Sequential targets.
-    @staticmethod
-    def _already_counted(agent_index, target):
-        return target.target_type == TargetType.SEQUENTIAL and agent_index in target.visitors
+        def dist(a, b):
+            return math.dist(pos[a], pos[b]) / speed   # rounds, same scale as action costs
 
+        actions = build_actions(me, num_agents, open_targets, dist, target_type, visited_by_me)
+        path = AStarPlanner(actions, check_budget=self._remaining).solve(
+            build_state(me, predicted), build_goal(open_targets))
+        if not path:
+            raise PlanningFailed("no plan reaches the goal")
 
+        # From 'cur' the only applicable actions are go_<me>_cur_<t>
+        return "FLY", int(path[0].rsplit("_", 1)[1])

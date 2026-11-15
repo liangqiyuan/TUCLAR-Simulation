@@ -11,9 +11,9 @@ from openai import APITimeoutError, BadRequestError, OpenAI
 import utils_geometry as geo
 from environment import VISIT_RADIUS_METERS, Environment, TargetType
 from htn_planner import (
+    AStarHTNPlanner,
     PlanningBudgetExceeded,
     PlanningFailed,
-    RulePlanner,
 )
 
 """
@@ -58,12 +58,11 @@ SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
 
 # Planner backend (used when PLANNER_MODE == "htn"):
-#   "rule"  deterministic non-HTN role-assignment rules
-#   "htn_llm"   determinisitic HTN planning, creating an Area hierarchy. Will delegate to LLM if it takes too long.
+#   "htn_llm"   determinisitic HTN planning, will delegate to LLM if it takes too long.
 #   "llm" llm only, no deterministic planning.
 PLANNER_MODE = "llm"
 HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
-HTN_BACKEND = "rule"
+HTN_BACKEND = "astar"
 
 # EXPERIMENTAL
 #   "all"        every drone, always (original behavior)
@@ -186,12 +185,10 @@ class Agent:
         self.last_stats = {}
         self.call_stats = []
 
-
-        llm_options = dict(max_depth=HTN_MAX_DEPTH, num_candidates=HTN_NUM_CANDIDATES,
-                           max_replans=HTN_MAX_REPLANS) if HTN_BACKEND == "llm" else {}
-
-        self.htn = RulePlanner(HTN_TIME_BUDGET_SECONDS)
+        self.htn = AStarHTNPlanner(HTN_TIME_BUDGET_SECONDS)
         self.delegated = False
+        self.plan_times = []
+        self.fallbacks = 0
 
     
 # _create:    prompts the AI, and records various timing & token metrics of the AI's output.
@@ -447,7 +444,7 @@ class AgentHandler:
           "prompt_style", "planning_style", "num_agents",
           "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
           "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance", "type_visibility",
-          "rule_ns_per_drone_round"]
+          "rule_ns_per_drone_round", "htn_avg_plan_s", "htn_fallback_rate"]
         
 
         target_types = self.environment.get_target_amounts()
@@ -487,6 +484,8 @@ class AgentHandler:
             self.failed_inference_chance,
             TARGET_TYPE_VISIBILITY,
             "" if rule is None or rule.avg_ns_per_drone_round is None else f"{rule.avg_ns_per_drone_round:.0f}",
+            self._avg_plan_s(),
+            self._fallback_rate(),
         ]
 
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
@@ -573,11 +572,14 @@ class AgentHandler:
         agent = self.agents[agent_index]
         update_message = self.generate_update_message(agent_index)  # always built and printed
 
+        t0 = time.perf_counter()
         if PLANNER_MODE == "htn_llm" and self.scenario == 1 and not agent.delegated:
             try:
-                kind, target = agent.htn.plan(agent_index, self.num_agents,
+                kind, target = agent.htn.plan(agent_index,
+                                              self.num_agents,
                                               self.environment.target_locations,
-                                              update_message)
+                                              self._planner_scene(agent_index))
+                agent.plan_times.append(time.perf_counter() - t0)
                 action = f"FLY {target}" if kind == "FLY" else kind
                 print(f"[HTN] drone {agent_index}: {action}")
                 reply = {"thought": "HTN plan",
@@ -594,7 +596,8 @@ class AgentHandler:
                 self.parse_response(json.dumps(reply), agent_index)
                 return
             except (PlanningBudgetExceeded, PlanningFailed) as e:
-                agent.delegated = True
+                agent.plan_times.append(time.perf_counter() - t0)
+                agent.fallbacks += 1
                 print(f"[HTN] drone {agent_index}: delegating to LLM ({e})")
 
         self.parse_response(agent.generate_response(update_message), agent_index)
@@ -873,6 +876,16 @@ class AgentHandler:
             seen[idx] = last
         return seen
 
+    def _planner_scene(self, agent_index):
+        agent = self.agents[agent_index]
+        views = self.teammate_views.get(agent_index) or self._observe_teammate_targets(agent_index)
+        return {
+            "location": tuple(agent.location),
+            "velocity": self.drone_velocity,
+            "teammate_targets": views,   # same noisy, line-of-sight-filtered view the prompt shows
+            "type_known": lambda t: type_is_known(t, agent_index),
+        }
+
 
 # Statistical helper functions
     def _avg_stat(self, key):
@@ -892,3 +905,11 @@ class AgentHandler:
             return ""
         count = sum(1 for a in self.agents for s in a.call_stats if s.get(key))
         return f"{count / total:.4f}"
+
+    def _avg_plan_s(self):
+        vals = [t for a in self.agents for t in a.plan_times]
+        return "" if not vals else f"{sum(vals) / len(vals):.6f}"
+
+    def _fallback_rate(self):
+        total = sum(len(a.plan_times) for a in self.agents)
+        return "" if not total else f"{sum(a.fallbacks for a in self.agents) / total:.4f}"

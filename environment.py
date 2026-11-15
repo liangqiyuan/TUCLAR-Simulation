@@ -150,7 +150,7 @@ class Environment:
                     TargetType.JOINT: random.randint(1, 4),
                     TargetType.SEQUENTIAL: random.randint(2, 4),
                 })
-                self._spawn_vision_obstacles(1)
+                #self._spawn_vision_obstacles(1)
 
     # Load map data. Just loads buildings for now.
     def _load_osm_features(self):
