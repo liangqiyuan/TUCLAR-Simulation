@@ -60,7 +60,7 @@ SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and d
 # Planner backend (used when PLANNER_MODE == "htn"):
 #   "htn_llm"   determinisitic HTN planning, will delegate to LLM if it takes too long.
 #   "llm" llm only, no deterministic planning.
-PLANNER_MODE = "llm"
+PLANNER_MODE = "htn_llm"
 HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
 HTN_BACKEND = "astar"
 

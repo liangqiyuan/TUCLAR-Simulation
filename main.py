@@ -70,7 +70,7 @@ class Simulation:
         match self.scenario:
             case 0: num_agents = 1
             case 1: num_agents = 5
-        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.8, 1000)
+        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.0, 1000)
         return True
 
 
@@ -354,7 +354,7 @@ def agent_worker(sim, response_queue, render_done=None):
 
 if __name__ == "__main__":
     session = time.strftime("%Y%m%d_%H%M%S")
-    for i in range(35):
+    for i in range(80):
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:

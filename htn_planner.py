@@ -132,20 +132,20 @@ def build_actions(me, n_drones, open_targets, dist, target_type, visited_by_me):
         here = f"at_{me}_{t}"
 
         if k is None:
-            acts.append(Action(f"scout_{me}_{t}", [here], [f"served_{t}"], [], cost=0.5))
+            acts.append(Action(f"scout_{me}_{t}", [here], [f"served_{t}"], [], cost=1))
         elif k == 1:
             acts.append(Action(f"clear_{me}_{t}", [here],
-                               [f"served_{t}", f"cleared_{t}"], [], cost=0.5))
+                               [f"served_{t}", f"cleared_{t}"], [], cost=1))
         elif k == 2:
             # Effects are just served_t for both, so join and hold reach the same state
             # and A* keeps the cheaper one instead of searching duplicate states.
             for p in partners:
                 acts.append(Action(f"join_{me}_{p}_{t}", [here, f"at_{p}_{t}"],
-                                   [f"served_{t}"], [], cost=0.5))
-            acts.append(Action(f"hold_{me}_{t}", [here], [f"served_{t}"], [], cost=3.0))
+                                   [f"served_{t}"], [], cost=1))
+            acts.append(Action(f"hold_{me}_{t}", [here], [f"served_{t}"], [], cost=1))
         elif k == 3 and t not in visited_by_me:
             acts.append(Action(f"visit_{me}_{t}", [here],
-                               [f"served_{t}", f"visited_{me}_{t}"], [], cost=0.5))
+                               [f"served_{t}", f"visited_{me}_{t}"], [], cost=1))
     return acts
 
 
