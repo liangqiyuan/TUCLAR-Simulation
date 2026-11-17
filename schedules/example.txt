@@ -1,0 +1,8 @@
+# comms   <start> <end>
+# sensing <start> <end>
+# wind    <start> <x> <y>    (stays in force until the next wind line)
+comms     10 25
+sensing   40 55
+wind      0  0   0
+wind      30 20 -10
+wind      80 0   0

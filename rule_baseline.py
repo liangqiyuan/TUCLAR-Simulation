@@ -18,7 +18,7 @@ from agent import (
     SHOW_TARGET_COORDS,
     TARGET_TYPE_VISIBILITY,
     Agent,
-    AgentHandler,
+    compute_velocity,
     type_is_known,
 )
 from environment import Environment, TargetLocation, TargetType
@@ -167,23 +167,25 @@ class RuleResult:
     avg_ns_per_drone_round: float | None = None
 
 
-def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance=0.0, noise_rng=None, type_visibility=TARGET_TYPE_VISIBILITY, vision_obstacles=()):
+def _observe(me, agents, targets, show_coords, show_own_location, noise_rng=None, type_visibility=TARGET_TYPE_VISIBILITY, vision_obstacles=(), comms_down=False, sensing_down=False):
     teammates = []
     for other in agents:
         if other is me or other.inaction:
             continue
 
         last = other.last_target
-        if any(o.blocks(me.location, other.location) for o in vision_obstacles):
+        if sensing_down or any(o.blocks(me.location, other.location) for o in vision_obstacles):
             last = -1   # no line of sight: target unknown
-        elif noise_rng is not None and noise_rng.random() < failed_inference_chance:
+        elif noise_rng is not None and noise_rng.random() < me.failed_inference_chance:
             last = noise_rng.randrange(len(targets))
 
         message = None
-        if comms_quality > 0.0:
-            in_range = (comms_distance == -1 or
-                        geo.geometric_mean_3d(*other.location, *me.location) <= comms_distance)
-            message = other.displayed_message if in_range else None
+        if other.comms_quality > 0.0:
+            if comms_down:
+                message = "Communication Failure."
+            else:
+                in_range = (other.comms_distance == -1 or geo.geometric_mean_3d(*other.location, *me.location) <= other.comms_distance)
+                message = other.displayed_message if in_range else None
         teammates.append(TeammateView(other.agent_index, last, message))
 
     seen = {me.agent_index: me.last_target, **{t.index: t.last_target for t in teammates}}
@@ -216,7 +218,7 @@ def _observe(me, agents, targets, comms_quality, comms_distance, show_coords, sh
     )
 
 
-def _apply(agent, decision, targets, comms_quality, rng):
+def _apply(agent, decision, targets, rng, comms_down=False):
     """Apply a decision; returns False if the action was invalid (the drone then idles)."""
     action = decision.action.strip()
     valid = True
@@ -241,17 +243,17 @@ def _apply(agent, decision, targets, comms_quality, rng):
     if not valid:
         agent.target_index = None
 
-    agent.displayed_message = (decision.message if rng.random() < comms_quality
-                               else "Communication Failure.")
+    agent.displayed_message = ("Communication Failure." if comms_down or rng.random() >= agent.comms_quality else decision.message)
     return valid
 
 
-def run_once(spec, num_agents, velocity, start, policy_factory, comms_quality, comms_distance, show_coords, show_own_location, seed, failed_inference_chance=0.0, type_visibility=TARGET_TYPE_VISIBILITY, vision_obstacles=()):
+def run_once(spec, drone_params, start, policy_factory, show_coords, show_own_location, seed,
+             type_visibility=TARGET_TYPE_VISIBILITY, vision_obstacles=(), schedule=None):
     rng = random.Random(seed)
+    num_agents = len(drone_params)
     targets = [TargetLocation(n, e, a, kind) for n, e, a, kind in spec]
     env = SimpleNamespace(target_locations=targets)
-    handler = SimpleNamespace(drone_velocity=velocity, environment=env)
-    agents = [Agent("", None, "", list(start), i) for i in range(num_agents)]
+    agents = [Agent("", None, "", list(start), i, params=drone_params[i]) for i in range(num_agents)]
     policies = [policy_factory(i, num_agents, random.Random(rng.getrandbits(32)))
                 for i in range(num_agents)]
     noise_rng = random.Random(rng.getrandbits(32))
@@ -259,20 +261,24 @@ def run_once(spec, num_agents, velocity, start, policy_factory, comms_quality, c
     t0 = time.perf_counter_ns()
 
     for rounds in range(1, MAX_ROUNDS + 1):
-        # Snapshot first: every drone decides from the same pre-round state
-        observations = {a.agent_index: _observe(a, agents, targets, comms_quality, comms_distance, show_coords, show_own_location, failed_inference_chance, noise_rng, type_visibility, vision_obstacles)
+        # The simulator numbers rounds from 0, so this is round `rounds - 1` there
+        comms_down, sensing_down, wind = (schedule.state(rounds - 1) if schedule
+                                          else (False, False, (0.0, 0.0)))
+        observations = {a.agent_index: _observe(a, agents, targets, show_coords, show_own_location,
+                                                noise_rng, type_visibility, vision_obstacles,
+                                                comms_down, sensing_down)
                         for a in agents if not a.inaction}
         decisions = {i: policies[i].decide(obs) for i, obs in observations.items()}
 
         for i, decision in decisions.items():
-            if not _apply(agents[i], decision, targets, comms_quality, rng):
+            if not _apply(agents[i], decision, targets, rng, comms_down):
                 invalid += 1
         for a in agents:
             if not a.inaction:
                 a.last_target = a.target_index
 
         for a in agents:
-            AgentHandler.update_velocity(handler, a)
+            a.velocity = compute_velocity(a, env, wind)
             a.step()
         Environment.check_visits(env, agents)
 
@@ -281,27 +287,24 @@ def run_once(spec, num_agents, velocity, start, policy_factory, comms_quality, c
             return True, sum(a.distance_traveled for a in agents), rounds, invalid, time.perf_counter_ns() - t0
     return False, None, MAX_ROUNDS, invalid, time.perf_counter_ns() - t0
 
-
-def evaluate(environment, num_agents, velocity, start=(0, 0, 1000), policy_factory=RulePolicy,
-             trials=1, comms_quality=0.0, comms_distance=1000,
-             show_coords=SHOW_TARGET_COORDS, show_own_location=SHOW_OWN_LOCATION, seed=0, failed_inference_chance=0.0, type_visibility=TARGET_TYPE_VISIBILITY):
+def evaluate(environment, drone_params, start=(0, 0, 1000), policy_factory=RulePolicy,
+             trials=1, show_coords=SHOW_TARGET_COORDS, show_own_location=SHOW_OWN_LOCATION, seed=0, type_visibility=TARGET_TYPE_VISIBILITY):
+    num_agents = len(drone_params)
     spec = [(t.north_m, t.east_m, t.alt, t.target_type) for t in environment.target_locations]
     dists, rounds_list, invalid_total = [], [], 0
     total_ns = total_drone_rounds = 0
     for k in range(trials):
-        ok, dist, rounds, invalid, elapsed_ns = run_once(spec,
-                                            num_agents,
-                                            velocity,
+        ok, dist, rounds, invalid, elapsed_ns = run_once(
+                                            spec,
+                                            drone_params,
                                             start,
                                             policy_factory,
-                                            comms_quality,
-                                            comms_distance,
                                             show_coords,
                                             show_own_location,
                                             seed + k,
-                                            failed_inference_chance,
                                             type_visibility,
-                                            environment.vision_obstacles)
+                                            environment.vision_obstacles,
+                                            environment.schedule)
         total_ns = elapsed_ns
         total_drone_rounds += num_agents * rounds
         invalid_total += invalid

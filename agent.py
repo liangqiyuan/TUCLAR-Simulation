@@ -4,6 +4,7 @@ import os
 import random
 import statistics
 import time
+from dataclasses import dataclass
 
 import httpx
 from openai import APITimeoutError, BadRequestError, OpenAI
@@ -128,6 +129,7 @@ Reply with a single JSON object and nothing else:
 
 SYSTEM_PROMPTS = {"short": SYSTEM_PROMPT_SHORT, "framework": SYSTEM_PROMPT_FRAMEWORK, "tos": SYSTEM_PROMPT_TOS}
 
+HOME = [0, 0, 0]
 
 # Tolerates raw newlines inside JSON strings (a failure the model produces now and then)
 _decoder = json.JSONDecoder(strict=False)
@@ -154,7 +156,6 @@ def split_reasoning(reasoning, content):
     return reasoning.strip(), content.strip()
 
 
-# EXPERIMENTAL
 def type_is_known(target, agent_index, mode=None):
     mode = mode or TARGET_TYPE_VISIBILITY
     if mode == "all":
@@ -163,11 +164,46 @@ def type_is_known(target, agent_index, mode=None):
         return bool(target.visitors)
     return agent_index in target.visitors
 
+def compute_velocity(agent, environment, wind):
+    """One round of velocity: motion toward the target plus wind.
+    IDLE drones and drones landed at home are not blown around."""
+    target = agent.target_index
+    if target is None or target == -1:
+        return [0, 0, 0]
+
+    if target == "Home":
+        distance = geo.point_distance(agent.location, HOME)
+        if distance < 1:
+            return [0, 0, 0]
+        if distance <= agent.drone_velocity:
+            return [-c for c in agent.location]       # final step: lands exactly, no wind
+        scale = agent.drone_velocity / distance
+        cmd = [-c * scale for c in agent.location]
+    elif isinstance(target, int):
+        goal = environment.target_locations[target].get_location()
+        distance = geo.point_distance(agent.location, goal)
+        if distance < 1e-6:
+            cmd = [0, 0, 0]
+        else:
+            scale = min(agent.drone_velocity, distance) / distance
+            cmd = [(goal[i] - agent.location[i]) * scale for i in range(3)]
+    else:
+        print(f"WARNING: Non-integer target index: {target}")
+        return [0, 0, 0]
+
+    return [cmd[0] + wind[0], cmd[1] + wind[1], cmd[2]]
+
+@dataclass
+class DroneParams:
+    comms_quality: float = 0.8              # chance a message this drone sends gets through (0-1)
+    comms_distance: float = 1000            # transmit distance in meters; -1 = unlimited
+    drone_velocity: float = 100             # Distance travelled per round (before wind effects)
+    failed_inference_chance: float = 0.15   # chance this drone misreads a teammate's target
 
 # Handles LLM calls & message history
 class Agent:
 
-    def __init__(self, system_prompt: str, client, model: str, start_location: [float, float, float], agent_index=-1):
+    def __init__(self, system_prompt: str, client, model: str, start_location: [float, float, float], agent_index=-1, params: DroneParams | None = None):
         self.history = [{"role": "system", "content": system_prompt}]
         self.recent = []  # last HISTORY_TURNS exchanges, stored compactly
         self.client = client
@@ -189,6 +225,12 @@ class Agent:
         self.delegated = False
         self.plan_times = []
         self.fallbacks = 0
+
+        p = params or DroneParams()
+        self.comms_quality = p.comms_quality
+        self.comms_distance = p.comms_distance
+        self.drone_velocity = p.drone_velocity
+        self.failed_inference_chance = p.failed_inference_chance
 
     
 # _create:    prompts the AI, and records various timing & token metrics of the AI's output.
@@ -318,20 +360,16 @@ class Agent:
 class AgentHandler:
 
     # Initiates the AI, creates the system prompts, initializes variables
-    def __init__(self, num_agents: int, scenario: int, environment: Environment, comms_quality: float = 0.5, comms_distance: int = 1000):
+    def __init__(self, num_agents: int, scenario: int, environment: Environment, drone_params: list[DroneParams] | None = None):
         self.client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
         self.model = LLM_MODEL
 
         self.scenario = scenario
         self.environment = environment
         self.num_rounds = 0
-        self.comms_quality = comms_quality #Set to 1 for perfect comms
-        self.comms_distance = comms_distance #Set to -1 for infinite range
-        self.drone_velocity = 100
         self.seconds_per_round = LLM_TIME_LIMIT_SECONDS
         self.sim_start = None
         self.sim_end = None
-        self.failed_inference_chance = 0.15
         self.teammate_views = {}
 
         self.system_prompt = SYSTEM_PROMPTS[PROMPT_STYLE]
@@ -372,8 +410,13 @@ class AgentHandler:
 
         self.num_agents = num_agents
         self.agents = []
+        if drone_params is None:
+            drone_params = [DroneParams() for _ in range(num_agents)]
+        if len(drone_params) != num_agents:
+            raise ValueError("drone_params must have one entry per agent")
+        self.drone_params = drone_params
         for idx in range(num_agents):
-            self.agents.append(Agent(system_prompt=self.system_prompt, client=self.client, model=self.model, start_location=[0, 0, 1000], agent_index=idx)) #TODO: Have system that detects ground level?
+            self.agents.append(Agent(system_prompt=self.system_prompt, client=self.client, model=self.model, start_location=[0, 0, 1000], agent_index=idx, params=drone_params[idx]))
 
         self.log_path = log_path
         self.summary_log_path = summary_log_path
@@ -444,7 +487,7 @@ class AgentHandler:
           "prompt_style", "planning_style", "num_agents",
           "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
           "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance", "type_visibility",
-          "rule_ns_per_drone_round", "htn_avg_plan_s", "htn_fallback_rate"]
+          "rule_ns_per_drone_round", "htn_avg_plan_s", "htn_fallback_rate", "comms_distance", "schedule"]
         
 
         target_types = self.environment.get_target_amounts()
@@ -453,7 +496,7 @@ class AgentHandler:
             f"{self.get_revisit_rate():.4f}",
             success,
             self.num_rounds,
-            self.comms_quality,
+            self._per_agent("comms_quality"),
             f"{self.get_sim_time():.2f}",
             self._avg_stat("ttft"),
             self._std_stat("ttft"),
@@ -477,15 +520,17 @@ class AgentHandler:
             target_types[2],
             sum(target_types),
             self.environment.area_size_m,
-            self.drone_velocity,
+            self._per_agent("drone_velocity"),
             self._num_calls(),
             self._rate_stat("timed_out"),
             self._rate_stat("invalid_json"),
-            self.failed_inference_chance,
+            self._per_agent("failed_inference_chance"),
             TARGET_TYPE_VISIBILITY,
             "" if rule is None or rule.avg_ns_per_drone_round is None else f"{rule.avg_ns_per_drone_round:.0f}",
             self._avg_plan_s(),
             self._fallback_rate(),
+            self._per_agent("comms_distance"),
+            self.environment.SCHEDULE or "",
         ]
 
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
@@ -534,6 +579,9 @@ class AgentHandler:
 
     # Update all agents on the situation, ask for a new course of action (or continue the current one)
     def update_agents(self):
+
+        self.environment.set_round(self.num_rounds)
+        print(f"Round {self.num_rounds}: comms_down={self.environment.comms_down}, sensing_down={self.environment.sensing_down}, wind={self.environment.wind}")
 
         # Record when the simulation started
         if self.sim_start is None:
@@ -643,45 +691,15 @@ class AgentHandler:
         else:
             print(f"Agent {agent_index} gave unrecognized action: {action!r}")
 
-        if random.random() < self.comms_quality:
-            agent.displayed_message = data.get("message", "")
-        else:
+        if self.environment.comms_down or random.random() >= agent.comms_quality:
             agent.displayed_message = "Communication Failure."
+        else:
+            agent.displayed_message = data.get("message", "")
 
     # Set velocity to go towards the target.
     # TODO: change velocity based on how much time the agent spent thinking?
     def update_velocity(self, agent):
-        if agent.target_index is None or agent.target_index == -1:
-            agent.velocity = [0, 0, 0]
-            return
-
-        if agent.target_index == "Home":
-            distance = geo.point_distance(agent.location, [0, 0, 0])
-            if distance < 1:
-                agent.velocity = [0, 0, 0]
-                return
-            speed = min(self.drone_velocity, distance)
-            scale = speed / distance
-            agent.velocity = [-d * scale for d in agent.location]
-            return
-
-        if not isinstance(agent.target_index, int):
-            print(f"WARNING: Non-integer target index: {agent.target_index}")
-        else:
-            target = self.environment.target_locations[agent.target_index]
-            target_location = target.get_location()
-
-            distance = geo.point_distance(agent.location, target_location)
-            if distance < 1e-6:
-                agent.velocity = [0, 0, 0]
-                return
-
-            delta = [target_location[i] - agent.location[i] for i in range(3)]
-            speed = min(self.drone_velocity, distance)
-            scale = speed / distance
-            agent.velocity = [d * scale for d in delta]
-
-
+        agent.velocity = compute_velocity(agent, self.environment, getattr(self.environment, "wind", (0.0, 0.0)))
 
     # Generate the message updating the agent on the status of the mission
     def generate_update_message(self, agent_index: int):
@@ -716,7 +734,7 @@ class AgentHandler:
                     teammate = self.agents[idx]
                     teammate_location = teammate.location
                     seen = views[idx]
-                    if seen == "blocked" or seen == -1:
+                    if seen == "blocked" or seen == -1 or seen == "sensor_failure":
                         teammate_target = "Unknown"
                     elif seen is None:
                         teammate_target = "None (idle)"
@@ -725,11 +743,14 @@ class AgentHandler:
                     update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
 
                     # Teammate message
-                    if self.comms_quality > 0.0:
-                        if self.comms_distance == -1 or geo.geometric_mean_3d(teammate_location[0], teammate_location[1], teammate_location[2], agent.location[0], agent.location[1], agent.location[2]) <= self.comms_distance:
-                            update_message += f"TEAMMATE {idx} SAYS: {self.agents[idx].displayed_message}\n"
+                    if teammate.comms_quality > 0.0:
+                        if self.environment.comms_down:
+                            update_message += f"TEAMMATE {idx} SAYS: Communication Failure.\n"
+                        elif (teammate.comms_distance == -1 or
+                            geo.geometric_mean_3d(*teammate_location, *agent.location) <= teammate.comms_distance):
+                            update_message += f"TEAMMATE {idx} SAYS: {teammate.displayed_message}\n"
                         else:
-                            update_message += f"TEAMMATE {idx} SAYS: Out of communication range.\n\n"
+                            update_message += f"No message received from TEAMMATE {idx}\n"
 
                 all_targets_visited = all(t.visited for t in self.environment.target_locations)
                 if not all_targets_visited:
@@ -867,11 +888,14 @@ class AgentHandler:
         for idx, mate in enumerate(self.agents):
             if idx == agent_index or mate.inaction:
                 continue
+            if self.environment.sensing_down:
+                seen[idx] = "sensor_failure"
+                continue
             if not self.environment.has_line_of_sight(me.location, mate.location):
                 seen[idx] = "blocked"
                 continue
             last = mate.last_target
-            if random.random() < self.failed_inference_chance:
+            if random.random() < me.failed_inference_chance:
                 last = random.randrange(len(self.environment.target_locations))
             seen[idx] = last
         return seen
@@ -881,7 +905,7 @@ class AgentHandler:
         views = self.teammate_views.get(agent_index) or self._observe_teammate_targets(agent_index)
         return {
             "location": tuple(agent.location),
-            "velocity": self.drone_velocity,
+            "velocity": agent.drone_velocity,
             "teammate_targets": views,   # same noisy, line-of-sight-filtered view the prompt shows
             "type_known": lambda t: type_is_known(t, agent_index),
         }
@@ -913,3 +937,7 @@ class AgentHandler:
     def _fallback_rate(self):
         total = sum(len(a.plan_times) for a in self.agents)
         return "" if not total else f"{sum(a.fallbacks for a in self.agents) / total:.4f}"
+
+    def _per_agent(self, attr):
+        vals = [getattr(a, attr) for a in self.agents]
+        return vals[0] if len(set(vals)) == 1 else "|".join(str(v) for v in vals)

@@ -8,6 +8,7 @@ import shutil
 import sys
 import threading
 import time
+from dataclasses import asdict
 
 import contextily as ctx
 import matplotlib.pyplot as plt
@@ -18,7 +19,7 @@ import agent as agent_mod
 import find_optimal
 import rule_baseline
 import utils_geometry as geo
-from agent import MAX_ROUNDS, AgentHandler
+from agent import MAX_ROUNDS, AgentHandler, DroneParams
 from environment import Environment, TargetType
 
 RECORD = False
@@ -70,7 +71,10 @@ class Simulation:
         match self.scenario:
             case 0: num_agents = 1
             case 1: num_agents = 5
-        self.handler = AgentHandler(num_agents, self.scenario, self.environment, 0.0, 1000)
+
+        # Edit individual entries for a heterogeneous team, e.g. DroneParams(comms_distance=500)
+        drone_params = [DroneParams() for _ in range(num_agents)]
+        self.handler = AgentHandler(num_agents, self.scenario, self.environment, drone_params)
         return True
 
 
@@ -202,8 +206,11 @@ class Simulation:
 
 
     def find_optimal(self):
-        optimal = find_optimal.solve(self.environment, self.scenario,
-                                     len(self.handler.agents), self.handler.drone_velocity)
+        speeds = [a.drone_velocity for a in self.handler.agents]
+        if len(set(speeds)) > 1:
+            print("WARNING: find_optimal supports one speed; using the mean of the drones' speeds.")
+        optimal = find_optimal.solve(self.environment, self.scenario, len(self.handler.agents), sum(speeds) / len(speeds))
+
         if optimal is None:
             print("No optimal solution found")
         else:
@@ -265,13 +272,10 @@ class Recorder:
             "area_size_m": sim.area_size_m,
             "bounds_lon_lat": list(sim.bounds),  # min_lon, max_lon, min_lat, max_lat
             "num_agents": h.num_agents,
-            "drone_velocity": h.drone_velocity,
-            "comms_quality": h.comms_quality,
-            "comms_distance": h.comms_distance,
-            "failed_inference_chance": h.failed_inference_chance,
-            "targets": [{"north_m": t.north_m, "east_m": t.east_m, "alt": t.alt,
-                         "type": t.target_type.value, "required_drones": t.required_drones}
-                        for t in env.target_locations],
+            "drones": [asdict(p) for p in h.drone_params],
+            "schedule": env.SCHEDULE,
+            "schedule_entries": {"outages": env.schedule.outages, "winds": env.schedule.winds, "default_wind": env.schedule.default_wind},
+            "targets": [{"north_m": t.north_m, "east_m": t.east_m, "alt": t.alt, "type": t.target_type.value, "required_drones": t.required_drones} for t in env.target_locations],
             "obstacles": [{"footprint_north_east": getattr(o, "footprint", None),
                            "base_alt": getattr(o, "base_alt", None),
                            "top_alt": getattr(o, "top_alt", None)}
@@ -354,7 +358,7 @@ def agent_worker(sim, response_queue, render_done=None):
 
 if __name__ == "__main__":
     session = time.strftime("%Y%m%d_%H%M%S")
-    for i in range(80):
+    for i in range(2):
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:
@@ -376,7 +380,7 @@ if __name__ == "__main__":
             sim.init_handler()
             sim.show_map()
             optimal = sim.find_optimal()
-            rule = rule_baseline.evaluate(sim.environment, sim.handler.num_agents, sim.handler.drone_velocity, comms_quality=sim.handler.comms_quality, comms_distance=sim.handler.comms_distance, failed_inference_chance=sim.handler.failed_inference_chance, trials=50)
+            rule = rule_baseline.evaluate(sim.environment, sim.handler.drone_params, trials=50)
 
             response_queue = queue.Queue()
             render_done = threading.Event() if RECORD else None

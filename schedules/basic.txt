@@ -1,0 +1,3 @@
+wind 0 5 3
+comms 20 30
+sensing 20 40

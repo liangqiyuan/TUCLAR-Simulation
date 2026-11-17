@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from enum import Enum
 
@@ -7,10 +8,62 @@ from shapely.geometry import LineString, Point, Polygon
 
 import utils_geometry as geo
 
+SCHEDULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schedules")
+
+
 """
-Exclusive: only one drone needs to visit the location for it to be considered cleared.
-Joint: two drones need to visit at the same time for the target to be considered cleared.
-Sequential: three drones need to visit the target, concurrency doesn't matter.
+A Schedule prescribes global events and changes to happen at certain times.
+Includes comms/sensing outages and wind changes, loaded from schedules/<name>.txt.
+"""
+class Schedule:
+
+    def __init__(self, outages=None, winds=None, default_wind=(0.0, 0.0)):
+        self.outages = outages or {"comms": [], "sensing": []}   # kind -> [(start, end)]
+        self.winds = sorted(winds or [], key=lambda w: w[0])     # [(start, (x, y))]
+        self.default_wind = tuple(default_wind)
+
+    @classmethod
+    def load(cls, name, default_wind=(0.0, 0.0), directory=SCHEDULE_DIR):
+        path = os.path.join(directory, name if name.endswith(".txt") else f"{name}.txt")
+        outages = {"comms": [], "sensing": []}
+        winds = []
+        with open(path) as f:
+            for lineno, raw in enumerate(f, 1):
+                parts = raw.split("#", 1)[0].split()
+                if not parts:
+                    continue
+                kind = parts[0].lower()
+                try:
+                    if kind in outages and len(parts) == 3:
+                        start, end = int(parts[1]), int(parts[2])
+                        if end < start:
+                            raise ValueError("end before start")
+                        outages[kind].append((start, end))
+                    elif kind == "wind" and len(parts) == 4:
+                        winds.append((int(parts[1]), (float(parts[2]), float(parts[3]))))
+                    else:
+                        raise ValueError("unknown type or wrong number of fields")
+                except ValueError as e:
+                    raise ValueError(f"{path}:{lineno}: {e}: {raw.strip()!r}") from e
+        return cls(outages, winds, default_wind)
+
+    def state(self, rnd):
+        """(comms_down, sensing_down, wind) in force during round rnd."""
+        comms = any(s <= rnd <= e for s, e in self.outages["comms"])
+        sensing = any(s <= rnd <= e for s, e in self.outages["sensing"])
+        wind = self.default_wind
+        for start, vec in self.winds:       # sorted; the latest entry already started wins
+            if start > rnd:
+                break
+            wind = vec
+        return comms, sensing, wind
+
+
+"""
+TargetType: Defines behavior of Targets (defined later)
+    Exclusive: only one drone needs to visit the location for it to be considered cleared.
+    Joint: two drones need to visit at the same time for the target to be considered cleared.
+    Sequential: three drones need to visit the target, concurrency doesn't matter.
 """
 class TargetType(Enum):
     EXCLUSIVE = "Exclusive"
@@ -129,6 +182,10 @@ class PrismObstacle(VisionObstacle):
 
 class Environment:
 
+    SCHEDULE = "basic.txt" # Enter the name of the file in schedules/ or leave as None for no events
+    
+    DEFAULT_WIND = (0.0, 0.0) # (North, East)
+
     def __init__(self, scenario: int, center_lat: float, center_lon: float, area_size_m: float = 1000):
         self.center_lat = center_lat
         self.center_lon = center_lon
@@ -150,7 +207,12 @@ class Environment:
                     TargetType.JOINT: random.randint(1, 4),
                     TargetType.SEQUENTIAL: random.randint(2, 4),
                 })
-                #self._spawn_vision_obstacles(1)
+                self._spawn_vision_obstacles(1)
+
+        self.schedule = (Schedule.load(self.SCHEDULE, self.DEFAULT_WIND) if self.SCHEDULE else Schedule(default_wind=self.DEFAULT_WIND))
+        self.comms_down = False
+        self.sensing_down = False
+        self.wind = list(self.DEFAULT_WIND)
 
     # Load map data. Just loads buildings for now.
     def _load_osm_features(self):
@@ -238,3 +300,7 @@ class Environment:
 
         return result
 
+    def set_round(self, rnd):
+        """Apply the schedule for round rnd. Call once at the start of each round."""
+        comms, sensing, wind = self.schedule.state(rnd)
+        self.comms_down, self.sensing_down, self.wind = comms, sensing, list(wind)
