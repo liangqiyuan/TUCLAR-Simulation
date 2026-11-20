@@ -358,7 +358,7 @@ def agent_worker(sim, response_queue, render_done=None):
 
 if __name__ == "__main__":
     session = time.strftime("%Y%m%d_%H%M%S")
-    for i in range(2):
+    for i in range(20):
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:
