@@ -11,12 +11,12 @@ from openai import APITimeoutError, BadRequestError, OpenAI
 
 import utils_geometry as geo
 from environment import VISIT_RADIUS_METERS, Environment, TargetType
-from htn_hierarchical import HierarchicalHTNPlanner
 from htn_planner import (
     AStarHTNPlanner,
     PlanningBudgetExceeded,
     PlanningFailed,
 )
+from htn_hierarchical import HierarchicalHTNPlanner
 from hybrid_planner import HybridConfig, HybridPlanner
 
 """
@@ -60,27 +60,30 @@ PROMPT_STYLE = "short"        # "short": message/action  |  "framework": state/r
 SHOW_OWN_LOCATION = False     # tell each agent its own X/Y
 SHOW_TARGET_COORDS = False    # tell each agent every pending target's X/Y and distance
 
-# Planner backend:
+# Planner backend (used when PLANNER_MODE == "htn"):
 #   "htn_llm"   determinisitic HTN planning, will delegate to LLM if it takes too long.
 #   "llm" llm only, no deterministic planning.
-#   "hybrid" uses HTN planning, but missing information is filled in with LLM reasoning.
-#            The underlying HTN planner can be the AStar or Hierarchical planner.
-PLANNER_MODE = "hybrid"
-HTN_TIME_BUDGET_SECONDS = 15            # real-world seconds per drone, from its first HTN decision
+#   "hybrid"    A* planner chooses every action; the LLM only forms beliefs about silent teammates;
+#               drones share claims/findings through a structured message codebook (hybrid_planner.py).
+PLANNER_MODE = "llm"
+HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN decision
+# Which planner decides the actions in "htn_llm" and "hybrid" modes:
+#   "astar"         flat STRIPS-style A* search (htn_planner.py)
+#   "hierarchical"  layered task tree: mission -> serve(target) -> primitive actions (htn_hierarchical.py)
+HTN_BACKEND = "astar"
+HTN_ENFORCE_HORIZON = True    # hierarchical only: a plan must leave time to fly home before MAX_ROUNDS
+HTN_HOLD_COST = 1.0           # hierarchical only: cost (rounds) of holding at a Joint target without a partner
 
-# "astar": STRIPS-style search, "hierarchical": multi-layered search
-HTN_BACKEND = "hierarchical"
-HTN_ENFORCE_HORIZON = False             # If true, all plans must leave sufficient time to fly home
-HTN_HOLD_COST = 1.0                     # Punishment for holding a joint target with no partner
-
-# Hybrid planning configuration
-HYBRID_USE_LLM = True
-HYBRID_USE_MESSAGES = True
-HYBRID_SHARE_TYPES = True               # Drones will share target types with each other if True
-HYBRID_BELIEF_TTL = 10                  # Number of rounds until beliefs expire
-HYBRID_STALE_FALLBACK = "last_known"    # "last_known" or "none", fallback for when beliefs expires and LLM is unavailable.
-HYBRID_PRINT_BELIEFS = True             # Print the belief prompt results to console.
-HYBRID_COLOR_BELIEFS = True             # Color-code printed belief output; green = accurate, red = inaccurate, yellow = invalid
+# Hybrid planner settings (used when PLANNER_MODE == "hybrid"). Switching use_llm / use_messages off
+# separately gives the reasoning-only, communication-only and neither ablations.
+HYBRID_USE_LLM = True                 # LLM beliefs about silent teammates
+HYBRID_USE_MESSAGES = True            # read and send codebook messages (claim(T), type(T,K), idle)
+HYBRID_SHARE_TYPES = True             # include type(T,K) findings in messages and accept them from teammates
+HYBRID_BELIEF_TTL = 10                # rounds before an LLM belief lapses
+HYBRID_MEMORY_TTL = 10                # rounds before a stale last-known claim is dropped (stops phantom claims)
+HYBRID_STALE_FALLBACK = "last_known"  # when no fresh info and no LLM belief: "last_known" or "none"
+HYBRID_PRINT_BELIEFS = False          # print each belief query's raw LLM output and parsed reply (None = timeout or unparseable)
+HYBRID_COLOR_BELIEFS = True           # color the printed beliefs: green = matches what the teammate is doing, red = wrong, yellow = invalid
 
 # EXPERIMENTAL
 #   "all"        every drone, always (original behavior)
@@ -148,16 +151,19 @@ SYSTEM_PROMPTS = {"short": SYSTEM_PROMPT_SHORT, "framework": SYSTEM_PROMPT_FRAME
 
 HOME = [0, 0, 0]
 
-# Tolerates raw newlines inside JSON strings (a failure the model produces now and then)
-_decoder = json.JSONDecoder(strict=False)
 
 def make_htn_planner():
     """A fresh per-drone planner for the configured HTN_BACKEND."""
     if HTN_BACKEND == "astar":
         return AStarHTNPlanner(HTN_TIME_BUDGET_SECONDS)
     if HTN_BACKEND == "hierarchical":
-        return HierarchicalHTNPlanner(HTN_TIME_BUDGET_SECONDS, home=HOME, horizon_rounds=MAX_ROUNDS if HTN_ENFORCE_HORIZON else None, hold_cost=HTN_HOLD_COST)
+        return HierarchicalHTNPlanner(HTN_TIME_BUDGET_SECONDS, home=HOME,
+                                      horizon_rounds=MAX_ROUNDS if HTN_ENFORCE_HORIZON else None,
+                                      hold_cost=HTN_HOLD_COST)
     raise ValueError(f"unknown HTN_BACKEND {HTN_BACKEND!r}")
+
+# Tolerates raw newlines inside JSON strings (a failure the model produces now and then)
+_decoder = json.JSONDecoder(strict=False)
 
 def extract_json_object(text, key="action"):
     """Return the last parseable JSON object containing `key`; ignores braces in reasoning text."""
@@ -252,12 +258,13 @@ class Agent:
             use_messages=HYBRID_USE_MESSAGES,
             share_types=HYBRID_SHARE_TYPES,
             belief_ttl=HYBRID_BELIEF_TTL,
+            memory_ttl=HYBRID_MEMORY_TTL,
             stale_fallback=HYBRID_STALE_FALLBACK,
             show_target_coords=SHOW_TARGET_COORDS,
             show_own_location=SHOW_OWN_LOCATION,
         ), planner=self.htn)
-        self.last_raw = {}
-        self.belief_hits = {}   # How often the LLM got guesses right
+        self.last_raw = {}      # raw output of the latest query_json call
+        self.belief_hits = {}   # belief source -> [correct, total]; scored against ground truth, logging only
         self.delegated = False
         self.plan_times = []
         self.fallbacks = 0
@@ -343,7 +350,6 @@ class Agent:
             else:
                 raise
         self.response_times.append(time.perf_counter() - started)
-        self.last_raw = {"reasoning": reasoning, "content": content}
 
         if self.last_stats["timed_out"]:
             self.last_stats["invalid_json"] = False  # timeouts are counted separately
@@ -381,6 +387,7 @@ class Agent:
             print(f"WARNING: agent {self.agent_index} belief query rejected: {e}")
             return None
         self.response_times.append(time.perf_counter() - started)
+        self.last_raw = {"reasoning": reasoning, "content": content}   # unprocessed model output, for printing
 
         if self.last_stats["timed_out"]:
             self.last_stats["invalid_json"] = False
@@ -481,6 +488,7 @@ class AgentHandler:
 
         self.log_path = log_path
         self.summary_log_path = summary_log_path
+        self.seed = None   # scenario seed of this run, set by main.py; logged in the summary
         self.init_log()
 
 
@@ -532,6 +540,7 @@ class AgentHandler:
         # num_joint: The number of joint targets.
         # num_sequential: The number of sequential targets.
         # num_targets: The total number of targets.
+        # num_vision_obstacles: Number of obstacles that block vision
         # area_size: Radius of the simulation area, in meters.
         # agent_speed: The maximum distance an agent can move in a round, in meters.
         # num_llm_calls: The number of times an agent was prompted
@@ -546,10 +555,10 @@ class AgentHandler:
           "avg_answer_s", "std_answer_s", "avg_completion_tokens", "std_completion_tokens", "optimal_distance",
           "optimal_rounds", "rule_success_rate", "rule_avg_distance", "rule_avg_rounds", "rule_invalid_actions",
           "prompt_style", "planning_style", "num_agents",
-          "num_exclusive", "num_joint", "num_sequential", "num_targets", "area_size", "agent_speed",
+          "num_exclusive", "num_joint", "num_sequential", "num_targets", "num_vision_obstacles", "area_size", "agent_speed",
           "num_llm_calls", "timeout_rate", "invalid_json_rate", "failed_inference_chance", "type_visibility",
           "rule_ns_per_drone_round", "htn_avg_plan_s", "htn_fallback_rate", "comms_distance", "schedule",
-          "hybrid_config", "belief_queries", "belief_acc_msg", "belief_acc_obs", "belief_acc_llm", "belief_acc_memory", "htn_backend"]
+          "hybrid_config", "belief_queries", "belief_acc_msg", "belief_acc_obs", "belief_acc_llm", "belief_acc_memory", "htn_backend", "seed"]
         
 
         target_types = self.environment.get_target_amounts()
@@ -600,6 +609,7 @@ class AgentHandler:
             self._belief_acc("llm"),
             self._belief_acc("memory"),
             HTN_BACKEND if PLANNER_MODE in ("htn_llm", "hybrid") else "",
+            "" if self.seed is None else self.seed,
         ]
 
         os.makedirs(os.path.dirname(self.summary_log_path) or ".", exist_ok=True)
@@ -659,6 +669,7 @@ class AgentHandler:
         # Decide who should or should not reason this round
         self.teammate_views = {i: self._observe_teammate_targets(i) for i in range(self.num_agents) if not self.agents[i].inaction}
         if PLANNER_MODE == "hybrid" and self.scenario == 1:
+            # Each drone folds this round's messages and observations into its own beliefs (no LLM here)
             for i in self.teammate_views:
                 self.agents[i].hybrid.observe(self._planner_scene(i), self.environment.target_locations)
         to_prompt = [idx for idx in range(self.num_agents) if self.should_prompt(self.agents[idx])]
@@ -728,6 +739,7 @@ class AgentHandler:
 
         self.parse_response(agent.generate_response(update_message), agent_index)
 
+
     # Hybrid decision: beliefs (messages, observation, LLM) -> A* plan -> action + codebook message.
     # The LLM never chooses the action; if the A* search runs out of budget a greedy rule does.
     def _decide_hybrid(self, agent_index: int):
@@ -741,9 +753,9 @@ class AgentHandler:
                 raw = agent.last_raw
                 if raw.get("reasoning"):
                     print(f"[BELIEF QUERY] drone {agent_index} reasoning:\n{raw['reasoning']}")
-                print(f"[BELIEF QUERY] drone {agent_index} parsed json: {self._format_beliefs(agent_index, reply)}")
+                print(f"[BELIEF QUERY] drone {agent_index} raw output:\n{raw.get('content')}")
+                print(f"[BELIEF QUERY] drone {agent_index} parsed: {self._format_beliefs(agent_index, reply)}")
             return reply
-
 
         try:
             kind, target = agent.hybrid.plan(agent_index, self.num_agents, targets, scene, ask)
@@ -763,7 +775,9 @@ class AgentHandler:
         self._score_beliefs(agent_index)
         self.parse_response(json.dumps({"thought": note, "message": message, "action": action}), agent_index)
 
-
+    # Render a belief query's parsed reply with each belief checked against what the teammate is actually
+    # doing (printing only; ground truth never reaches a planner). Green = correct, red = wrong (with the
+    # actual target), yellow = not a legal belief (unknown or inactive teammate, bad value).
     def _format_beliefs(self, agent_index: int, reply):
         beliefs = reply.get("beliefs") if isinstance(reply, dict) else None
         if not isinstance(beliefs, dict):
@@ -801,7 +815,6 @@ class AgentHandler:
         reason = json.dumps(reply.get("reason", ""))
         return "{" + f'"reason": {reason}, "beliefs": {{' + ", ".join(parts) + "}}"
 
-
     # Compare the beliefs a drone just planned with against what its teammates are actually doing.
     # Ground truth is read here for logging only and never reaches a planner.
     def _score_beliefs(self, agent_index: int):
@@ -816,7 +829,6 @@ class AgentHandler:
             stat = agent.belief_hits.setdefault(belief.source, [0, 0])
             stat[0] += int(hit)
             stat[1] += 1
-
 
     # Interpret the response, search for which target the agent wants to head toward
     def parse_response(self, response: str, agent_index: int):
@@ -1029,6 +1041,7 @@ class AgentHandler:
         slots = target.required_drones if known else UNKNOWN_SLOT_GUESS
 
         # Rivals are teammates this drone believes are heading to the same target
+        # (hybrid: beliefs built from messages, observation and LLM estimates)
         views = agent.hybrid.fresh_claims() if hybrid else self.teammate_views.get(me, {})
         rivals = [me] + [i for i, t in views.items()
                          if t == agent.target_index and not self.agents[i].inaction]
@@ -1071,35 +1084,37 @@ class AgentHandler:
 
     def _received_messages(self, agent_index):
         """What this drone hears from each active teammate: their displayed message, the failure
-         notice during an outage, or None when out of range / silent. Same rules the prompt applies."""
+        notice during an outage, or None when out of range / silent. Same rules the prompt applies."""
         me = self.agents[agent_index]
         heard = {}
         for idx, mate in enumerate(self.agents):
             if idx == agent_index or mate.inaction:
-                 continue
+                continue
             if mate.comms_quality <= 0.0:
                 heard[idx] = None
             elif self.environment.comms_down:
                 heard[idx] = "Communication Failure."
-            elif (mate.comms_distance == -1 or geo.geometric_mean_3d(*mate.location, *me.location) <= mate.comms_distance):
-                 heard[idx] = mate.displayed_message
+            elif (mate.comms_distance == -1 or
+                  geo.geometric_mean_3d(*mate.location, *me.location) <= mate.comms_distance):
+                heard[idx] = mate.displayed_message
             else:
                 heard[idx] = None
         return heard
 
     def _planner_scene(self, agent_index):
-       agent = self.agents[agent_index]
-       views = self.teammate_views.get(agent_index) or self._observe_teammate_targets(agent_index)
-       return {
-           "location": tuple(agent.location),
-           "velocity": agent.drone_velocity,
-           "teammate_targets": views,   # same noisy, line-of-sight-filtered view the prompt shows
-           "type_known": lambda t: type_is_known(t, agent_index),
-           "messages": self._received_messages(agent_index),
-           "round": self.num_rounds,
-           "my_target": agent.last_target,
-       }
-                                 
+        agent = self.agents[agent_index]
+        views = self.teammate_views.get(agent_index) or self._observe_teammate_targets(agent_index)
+        return {
+            "location": tuple(agent.location),
+            "velocity": agent.drone_velocity,
+            "teammate_targets": views,   # same noisy, line-of-sight-filtered view the prompt shows
+            "type_known": lambda t: type_is_known(t, agent_index),
+            "messages": self._received_messages(agent_index),
+            "round": self.num_rounds,
+            "my_target": agent.last_target,
+        }
+
+
 # Statistical helper functions
     def _avg_stat(self, key):
         vals = [s[key] for a in self.agents for s in a.call_stats if s.get(key) is not None]

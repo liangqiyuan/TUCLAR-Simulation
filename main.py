@@ -1,13 +1,18 @@
 import warnings
 
 warnings.filterwarnings('ignore')
+import argparse
+import csv
 import json
+import multiprocessing
 import os
 import queue
+import random
 import shutil
 import sys
 import threading
 import time
+import traceback
 from dataclasses import asdict
 
 import contextily as ctx
@@ -22,10 +27,21 @@ import utils_geometry as geo
 from agent import MAX_ROUNDS, AgentHandler, DroneParams
 from environment import Environment, TargetType
 
-RECORD = True
+RECORD = False
 RECORD_DIR = os.environ.get("LOG_DIR", ".")
 
 HEADLESS = not os.environ.get("DISPLAY")
+
+# Batch settings; the command-line flags --runs, --seed and --parallel override these.
+NUM_RUNS = 20    # how many simulations to run
+SEED = None      # int: targets, target types and obstacles are identical in every run. None: different every run.
+PARALLEL = 1     # simulations running at once. Above 1 is a headless batch: no map, no recording, one process per run.
+
+# Per-drone parameter overrides applied to every drone (set by command-line flags, e.g. comms_quality)
+DRONE_OVERRIDES = {}
+
+# Parameters of the simulated area (shared by the interactive and batch paths)
+SCENARIO, CENTER_LAT, CENTER_LON, AREA_SIZE_M = 1, 44.6883889, -111.1176389, 2500
 
 TARGET_COLORS = {
     TargetType.EXCLUSIVE: "red",
@@ -73,7 +89,7 @@ class Simulation:
             case 1: num_agents = 5
 
         # Edit individual entries for a heterogeneous team, e.g. DroneParams(comms_distance=500)
-        drone_params = [DroneParams() for _ in range(num_agents)]
+        drone_params = [DroneParams(**DRONE_OVERRIDES) for _ in range(num_agents)]
         self.handler = AgentHandler(num_agents, self.scenario, self.environment, drone_params)
         return True
 
@@ -337,6 +353,138 @@ class Recorder:
                 shutil.copy(p, self.run_dir)
 
 
+# ---------------------------------------------------------------------------
+# Batch mode: many headless simulations at once
+# ---------------------------------------------------------------------------
+_SHARED = {}   # filled by the parent before the workers fork: reference results for a seeded batch
+
+
+def enable_osm_cache():
+    """Every Environment downloads its building data; with many runs at once that would hammer the OSM
+    server, so download once and reuse. The cache is built in the parent and inherited by forked workers."""
+    original = Environment._load_osm_features
+    cache = {}
+
+    def cached(self):
+        key = (self.center_lat, self.center_lon, self.area_size_m)
+        if key not in cache:
+            original(self)
+            cache[key] = self.buildings_gdf
+        self.buildings_gdf = cache[key]
+
+    Environment._load_osm_features = cached
+
+
+def append_summary(main_path, run_path):
+    """Merge one run's summary file into the shared summary_log.csv. Only the parent calls this, so
+    there is a single writer. If the columns differ from the existing file, it is moved aside as usual."""
+    with open(run_path, newline="") as f:
+        rows = list(csv.reader(f))
+    if len(rows) < 2:
+        return
+    header, data = rows[0], rows[1:]
+    os.makedirs(os.path.dirname(main_path) or ".", exist_ok=True)
+    if os.path.exists(main_path):
+        with open(main_path, newline="") as f:
+            existing = next(csv.reader(f), None)
+        if existing != header:
+            backup = f"{main_path}.{int(time.time())}.bak"
+            os.rename(main_path, backup)
+            print(f"Summary log columns changed; old log moved to {backup}")
+    is_new = not os.path.exists(main_path)
+    with open(main_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(header)
+        writer.writerows(data)
+
+
+def _run_worker(task):
+    """One complete simulation in its own process. All of its output and logs go to its run folder."""
+    i, seed, session_dir = task
+    run_dir = os.path.join(session_dir, f"run_{i:03d}")
+    os.makedirs(run_dir, exist_ok=True)
+    out = open(os.path.join(run_dir, "output.txt"), "w", buffering=1)
+    sys.stdout = sys.stderr = out
+    summary_path = os.path.join(run_dir, "summary_log.csv")
+    try:
+        # Forked workers inherit the parent's random state: without this every unseeded run would be identical
+        if seed is None:
+            random.seed()
+        else:
+            random.seed(seed)             # same targets, types and obstacles in every run
+        agent_mod.log_path = os.path.join(run_dir, "log.csv")
+        agent_mod.summary_log_path = summary_path
+
+        sim = Simulation(SCENARIO, CENTER_LAT, CENTER_LON, AREA_SIZE_M)
+        sim.init_scenario()
+        sim.init_handler()
+        sim.handler.seed = seed
+
+        if "optimal" in _SHARED:          # seeded batch: the scenario is the same, so reuse the reference results
+            optimal, rule = _SHARED["optimal"], _SHARED["rule"]
+        else:
+            optimal = sim.find_optimal()
+            rule = rule_baseline.evaluate(sim.environment, sim.handler.drone_params, trials=50)
+
+        # From here on the randomness (message loss, sensing noise) is separate from the scenario:
+        # reproducible per (seed, run) when seeded, fresh otherwise
+        random.seed() if seed is None else random.seed(f"{seed}:{i}")
+
+        while not (sim.check_success() or sim.check_failure()):
+            sim.handler.update_agents()
+        success = sim.check_success()
+        sim.handler.log_summary(success, optimal, rule)
+        return i, success, sim.handler.num_rounds, run_dir, None
+    except Exception:
+        traceback.print_exc()
+        return i, None, None, run_dir, "crashed (see output.txt)"
+    finally:
+        out.close()
+
+
+def run_batch(num_runs, seed, parallel, session):
+    session_dir = os.path.join(RECORD_DIR, session)
+    os.makedirs(session_dir, exist_ok=True)
+    parallel = max(1, min(parallel, num_runs))
+    enable_osm_cache()
+
+    # One scenario in the parent: fills the OSM cache, and in a seeded batch gives every run the same
+    # optimal/rule-baseline reference, computed once instead of once per run.
+    if seed is not None:
+        random.seed(seed)
+    sim = Simulation(SCENARIO, CENTER_LAT, CENTER_LON, AREA_SIZE_M)
+    sim.init_scenario()
+    if seed is not None:
+        sim.init_handler()
+        _SHARED["optimal"] = sim.find_optimal()
+        _SHARED["rule"] = rule_baseline.evaluate(sim.environment, sim.handler.drone_params, trials=50)
+
+    print(f"Batch: {num_runs} runs, {parallel} at a time, seed={seed}. Output in {session_dir}")
+    tasks = [(i, seed, session_dir) for i in range(num_runs)]
+    main_summary = agent_mod.summary_log_path
+    ctx = multiprocessing.get_context("fork")        # workers inherit the OSM cache and shared results
+    done = wins = 0
+    pool = ctx.Pool(processes=parallel, maxtasksperchild=1)   # a fresh process per run: no state carries over
+    try:
+        for i, success, rounds, run_dir, error in pool.imap_unordered(_run_worker, tasks):
+            done += 1
+            if error:
+                print(f"[{done}/{num_runs}] run {i:03d}: {error}", flush=True)
+                continue
+            wins += bool(success)
+            append_summary(main_summary, os.path.join(run_dir, "summary_log.csv"))
+            print(f"[{done}/{num_runs}] run {i:03d}: {'success' if success else 'failure'} in {rounds} rounds",
+                  flush=True)
+        pool.close()
+        pool.join()
+    except KeyboardInterrupt:
+        print("Interrupted; stopping workers.")
+        pool.terminate()
+        raise
+    print(f"Finished {done}/{num_runs} runs, {wins} successful. Summary rows appended to {main_summary}")
+
+
 response_queue = queue.Queue()
 
 
@@ -356,9 +504,53 @@ def agent_worker(sim, response_queue, render_done=None):
         import traceback; traceback.print_exc()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run drone simulations (interactive, or a headless parallel batch).")
+    parser.add_argument("--runs", type=int, default=NUM_RUNS, help="number of simulations")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help="fix targets, target types and obstacles so every run uses the same scenario")
+    parser.add_argument("--parallel", type=int, default=PARALLEL,
+                        help="simulations to run at once; above 1 runs headless, one process per run")
+    parser.add_argument("--planner", choices=["llm", "htn_llm", "hybrid"], default=None,
+                        help="planning style (PLANNER_MODE in agent.py); default: the value in agent.py")
+    parser.add_argument("--htn-backend", choices=["astar", "hierarchical"], default=None,
+                        help="HTN planner used by htn_llm and hybrid (HTN_BACKEND in agent.py)")
+    parser.add_argument("--comms-quality", type=_unit_interval, default=None,
+                        help="chance (0-1) that a message a drone sends gets through, for every drone")
+    return parser.parse_args()
+
+
+def _unit_interval(text):
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"{text} is not between 0 and 1")
+    return value
+
+
+def apply_agent_settings(args):
+    """Copy command-line overrides into the agent module and drone parameters. This must run before any
+    simulation starts; forked batch workers inherit the result."""
+    if args.planner is not None:
+        agent_mod.PLANNER_MODE = args.planner
+    if args.htn_backend is not None:
+        agent_mod.HTN_BACKEND = args.htn_backend
+    if args.comms_quality is not None:
+        DRONE_OVERRIDES["comms_quality"] = args.comms_quality
+    print(f"Settings: planner={agent_mod.PLANNER_MODE}, htn_backend={agent_mod.HTN_BACKEND}, "
+          f"comms_quality={DRONE_OVERRIDES.get('comms_quality', DroneParams().comms_quality)}")
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    apply_agent_settings(args)
     session = time.strftime("%Y%m%d_%H%M%S")
-    for i in range(2):
+    if args.parallel > 1:
+        if RECORD:
+            print("NOTE: RECORD is ignored in parallel mode (no map to record); each run still saves output.txt.")
+        run_batch(args.runs, args.seed, args.parallel, session)
+        sys.exit(0)
+
+    for i in range(args.runs):
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:
@@ -375,12 +567,17 @@ if __name__ == "__main__":
             sys.stderr = Tee(real_err, out_file, lock, events_file)
 
         try:
-            sim = Simulation(scenario=1, center_lat=44.6883889, center_lon=-111.1176389, area_size_m=2500)
+            if args.seed is not None:
+                random.seed(args.seed)   # the scenario (targets, types, obstacles) is generated from this
+            sim = Simulation(SCENARIO, CENTER_LAT, CENTER_LON, AREA_SIZE_M)
             sim.init_scenario()
             sim.init_handler()
+            sim.handler.seed = args.seed
             sim.show_map()
             optimal = sim.find_optimal()
             rule = rule_baseline.evaluate(sim.environment, sim.handler.drone_params, trials=50)
+            if args.seed is not None:
+                random.seed(f"{args.seed}:{i}")   # message loss and sensing noise: reproducible per (seed, run)
 
             response_queue = queue.Queue()
             render_done = threading.Event() if RECORD else None

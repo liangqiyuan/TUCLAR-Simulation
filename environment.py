@@ -182,7 +182,7 @@ class PrismObstacle(VisionObstacle):
 
 class Environment:
 
-    SCHEDULE = "basic.txt" # Enter the name of the file in schedules/ or leave as None for no events
+    SCHEDULE = None # Enter the name of the file in schedules/ or leave as None for no events
     
     DEFAULT_WIND = (0.0, 0.0) # (North, East)
 
