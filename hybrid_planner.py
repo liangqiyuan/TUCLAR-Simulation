@@ -13,7 +13,7 @@ Implements the architecture proposed in "Collaborative Autonomy under Limited Co
                                          so a drone that comes back into range receives the repeat)
   LLM reasoning about silent teammates   _belief_prompt() / _apply_llm(): LLM returns beliefs only
   A message replaces any belief          observe(): message > observation > unexpired LLM belief > memory
-  A belief lapses after a set time       HybridConfig.belief_ttl
+  A belief lapses after a set time       HybridConfig.belief_ttl (LLM beliefs), memory_ttl (stale claims)
   Shared priority rule                   Lowest drone index keeps a contested target (AgentHandler._is_surplus,
                                          fed by fresh_claims())
   Communication vs reasoning trade-off   HybridConfig.use_messages / use_llm ablation switches
@@ -42,13 +42,14 @@ class HybridConfig:
     use_messages: bool = True         # False: ignore the codebook (planner + observation + LLM only)
     share_types: bool = True          # include type(T,K) findings in messages and accept them
     belief_ttl: int = 10              # rounds before an LLM belief lapses
+    memory_ttl: int = 10              # rounds before a stale last-known claim stops counting as a belief
     stale_fallback: str = "last_known"  # no fresh info and no LLM belief: "last_known" claim or "none"
     show_target_coords: bool = False  # mirror the prompt flags so the LLM sees what other prompts show
     show_own_location: bool = False
 
     def label(self):
         return (f"llm={int(self.use_llm)},msg={int(self.use_messages)},types={int(self.share_types)},"
-                f"ttl={self.belief_ttl},stale={self.stale_fallback}")
+                f"ttl={self.belief_ttl},mttl={self.memory_ttl},stale={self.stale_fallback}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +188,10 @@ class HybridPlanner:
                     belief = prev
                 elif self.cfg.stale_fallback == "last_known":
                     lk = self.last_known.get(j)
-                    if lk is not None and lk.target is not None and not self._dead(lk.target, targets):
+                    # A last-known claim only counts while it is recent; an old one would hold a target
+                    # "covered" forever for a teammate that may have moved on.
+                    if (lk is not None and lk.target is not None and not self._dead(lk.target, targets)
+                            and rnd - lk.round < self.cfg.memory_ttl):
                         belief = Belief(lk.target, "memory", lk.round)
 
             if belief is not None:
