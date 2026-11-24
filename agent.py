@@ -11,12 +11,12 @@ from openai import APITimeoutError, BadRequestError, OpenAI
 
 import utils_geometry as geo
 from environment import VISIT_RADIUS_METERS, Environment, TargetType
+from htn_hierarchical import HierarchicalHTNPlanner
 from htn_planner import (
     AStarHTNPlanner,
     PlanningBudgetExceeded,
     PlanningFailed,
 )
-from htn_hierarchical import HierarchicalHTNPlanner
 from hybrid_planner import HybridConfig, HybridPlanner
 
 """
@@ -40,10 +40,10 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
 LLM_API_KEY = os.environ.get("NVIDIA_API_KEY", "EMPTY")
 LLM_MODEL = os.environ.get("MODEL", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16")
 LLM_TIME_LIMIT_SECONDS = 30
-LLM_ENABLE_REASONING = True
+LLM_ENABLE_REASONING = False
 LLM_REMEMBER_REASONING = True
-MAX_TOKENS = 32000
-TEMPERATURE = 0.0
+MAX_TOKENS = 1000
+TEMPERATURE = 0.2
 HISTORY_TURNS = 3
 
 # Simulation settings
@@ -70,13 +70,13 @@ HTN_TIME_BUDGET_SECONDS = 15  # real-world seconds per drone, from its first HTN
 # Which planner decides the actions in "htn_llm" and "hybrid" modes:
 #   "astar"         flat STRIPS-style A* search (htn_planner.py)
 #   "hierarchical"  layered task tree: mission -> serve(target) -> primitive actions (htn_hierarchical.py)
-HTN_BACKEND = "astar"
+HTN_BACKEND = "hierarchical"
 HTN_ENFORCE_HORIZON = True    # hierarchical only: a plan must leave time to fly home before MAX_ROUNDS
 HTN_HOLD_COST = 1.0           # hierarchical only: cost (rounds) of holding at a Joint target without a partner
 
 # Hybrid planner settings (used when PLANNER_MODE == "hybrid"). Switching use_llm / use_messages off
 # separately gives the reasoning-only, communication-only and neither ablations.
-HYBRID_USE_LLM = True                 # LLM beliefs about silent teammates
+HYBRID_USE_LLM = False                 # LLM beliefs about silent teammates
 HYBRID_USE_MESSAGES = True            # read and send codebook messages (claim(T), type(T,K), idle)
 HYBRID_SHARE_TYPES = True             # include type(T,K) findings in messages and accept them from teammates
 HYBRID_BELIEF_TTL = 10                # rounds before an LLM belief lapses
@@ -85,19 +85,36 @@ HYBRID_STALE_FALLBACK = "last_known"  # when no fresh info and no LLM belief: "l
 HYBRID_PRINT_BELIEFS = False          # print each belief query's raw LLM output and parsed reply (None = timeout or unparseable)
 HYBRID_COLOR_BELIEFS = True           # color the printed beliefs: green = matches what the teammate is doing, red = wrong, yellow = invalid
 
-# EXPERIMENTAL
-#   "all"        every drone, always (original behavior)
+
+## Obstacles and other complications
+
+# Target Type Visibility
+#   "all"        every drone, always
 #   "any_visit"  every drone, once any drone has visited the target
 #   "own_visit"  a drone only learns a type by visiting that target itself
 TARGET_TYPE_VISIBILITY = "own_visit"
+
+# Whether or not agents can infer each other's directions
+OBSERVATION = False
 
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT_SHORT = """
 Your output must be in valid JSON format. Do not output anything else.
+Your JSON may begin with a "thought" component as a space for you to reason about what's happening.
 Your JSON must have "message", and "action" components.
 You can communicate to your teammates through "message", but they may or may not receive it.
+
+## Reply format
+Reply with a single JSON object and nothing else:
+
+{
+    "thought": "Enter your reasoning here",
+    "message": "Enter a message here. Your teammates may or may not get it; communication is unreliable.",
+    "action": "Your choice of action."
+}
+
 """
 
 SYSTEM_PROMPT_FRAMEWORK = """
@@ -224,12 +241,43 @@ def compute_velocity(agent, environment, wind):
 
     return [cmd[0] + wind[0], cmd[1] + wind[1], cmd[2]]
 
+def build_schema():
+    actions = ["IDLE", "RECALL"] + [f"FLY {t}" for t in range(100)]
+    return {
+        "type": "object",
+        "properties": {
+            "thought": {"type": "string", "maxLength": 300},
+            "action": {"type": "string", "enum": actions},
+            "message": {"type": "string", "maxLength": 200},
+        },
+        "required": ["thought", "action", "message"],
+        "additionalProperties": False,
+    }
+
+def build_belief_schema(teammates):
+    """Schema for a belief query: one entry per silent teammate, each a target index or null (idle).
+    Needed because _create otherwise forces every reply into the action schema, which has no room for beliefs."""
+    return {
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "maxLength": 300},
+            "beliefs": {
+                "type": "object",
+                "properties": {str(j): {"anyOf": [{"type": "integer"}, {"type": "null"}]} for j in teammates},
+                "required": [str(j) for j in teammates],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["reason", "beliefs"],
+        "additionalProperties": False,
+    }
+
 @dataclass
 class DroneParams:
     comms_quality: float = 0.8              # chance a message this drone sends gets through (0-1)
-    comms_distance: float = 1000            # transmit distance in meters; -1 = unlimited
+    comms_distance: float = 5000            # transmit distance in meters; -1 = unlimited
     drone_velocity: float = 100             # Distance travelled per round (before wind effects)
-    failed_inference_chance: float = 0.15   # chance this drone misreads a teammate's target
+    failed_inference_chance: float = 0.0   # chance this drone misreads a teammate's target
 
 # Handles LLM calls & message history
 class Agent:
@@ -278,7 +326,7 @@ class Agent:
     
 # _create:    prompts the AI, and records various timing & token metrics of the AI's output.
 #            returns the reasoning and the non-reasoning parts of the response separately.    
-    def _create(self, messages):
+    def _create(self, messages, schema=None, schema_name="agent_action"):
         t0 = time.perf_counter()
         reasoning, content = [], []
         t_first = t_reason_end = None
@@ -290,7 +338,12 @@ class Agent:
                 model=self.model, messages=messages,
                 max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
                 extra_body={"chat_template_kwargs": {"enable_thinking": LLM_ENABLE_REASONING, "thinking": LLM_ENABLE_REASONING}},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": schema_name, "schema": schema or build_schema(), "strict": True},
+                },
                 stream=True,
+                presence_penalty=0.3,
                 stream_options={"include_usage": True},
                 timeout=LLM_TIME_LIMIT_SECONDS,
             )
@@ -378,11 +431,12 @@ class Agent:
 
     # One stateless LLM call that must return a JSON object containing `key` (no chat history is kept).
     # Used by the hybrid planner for belief queries; timing and token stats join call_stats.
-    def query_json(self, system_prompt, message, key):
+    def query_json(self, system_prompt, message, key, schema=None):
         started = time.perf_counter()
         try:
             reasoning, content = self._create([{"role": "system", "content": system_prompt},
-                                               {"role": "user", "content": message}])
+                                               {"role": "user", "content": message}],
+                                              schema=schema, schema_name="belief_query")
         except BadRequestError as e:
             print(f"WARNING: agent {self.agent_index} belief query rejected: {e}")
             return None
@@ -454,7 +508,7 @@ class AgentHandler:
             1: """
                 MISSION REQUIREMENTS:
                     1. There is a series of locations that you will be given.
-                    2. You will have a series of teammates. All your teammates reason exactly the same as you. The prompt will tell you what they are doing, but each prompt has a chance of giving the wrong value. Be cautious of this input error.
+                    2. You will have a series of teammates. All your teammates reason exactly the same as you. The prompt may tell you what they are doing, but each prompt has a chance of giving the wrong value. Be cautious of this input error.
                     3. The mission is a success once all target locations are cleared, and you have used the RECALL action to go back to start.
                     4. There are three types of target location: Sequential, which must be visited by three different agents at any point (you do not need to all visit at the same time). Joint, which must be visited by two different agents at the *same time*. And Exclusive, which must be visited by any agent.
                     5. Complete the mission as quick as possible.
@@ -464,7 +518,7 @@ class AgentHandler:
                             "RECALL": Go back to your starting location.
                     7. It takes multiple rounds for you to travel to a location. You may need to use the FLY action multiple times on the same target before you arrive. Do not assume a target has been visited until it has been cleared from the target list.
 
-                    Example JSON output: {"message": "communicate with your teammates here", "action": "Enter your action here"}
+                    Example JSON output: {"thought": "reason about the context here", "message": "communicate with your teammates here", "action": "Enter your action here"}
             """
         }
 
@@ -595,6 +649,7 @@ class AgentHandler:
             self._num_calls(),
             self._rate_stat("timed_out"),
             self._rate_stat("invalid_json"),
+            len(self.environment.vision_obstacles),
             self._per_agent("failed_inference_chance"),
             TARGET_TYPE_VISIBILITY,
             "" if rule is None or rule.avg_ns_per_drone_round is None else f"{rule.avg_ns_per_drone_round:.0f}",
@@ -747,8 +802,8 @@ class AgentHandler:
         targets = self.environment.target_locations
         scene = self._planner_scene(agent_index)
 
-        def ask(system_prompt, user_prompt):
-            reply = agent.query_json(system_prompt, user_prompt, key="beliefs")
+        def ask(system_prompt, user_prompt, silent):
+            reply = agent.query_json(system_prompt, user_prompt, key="beliefs", schema=build_belief_schema(silent))
             if HYBRID_PRINT_BELIEFS:
                 raw = agent.last_raw
                 if raw.get("reasoning"):
@@ -909,17 +964,18 @@ class AgentHandler:
                     if idx == agent_index or self.agents[idx].inaction:
                         continue
                    
-                    # Teammate direction
                     teammate = self.agents[idx]
                     teammate_location = teammate.location
-                    seen = views[idx]
-                    if seen == "blocked" or seen == -1 or seen == "sensor_failure":
-                        teammate_target = "Unknown"
-                    elif seen is None:
-                        teammate_target = "None (idle)"
-                    else:
-                        teammate_target = self._target_name(seen, self.environment.target_locations[seen], agent_index)
-                    update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
+                    # Teammate direction
+                    if OBSERVATION:
+                        seen = views[idx]
+                        if seen == "blocked" or seen == -1 or seen == "sensor_failure":
+                            teammate_target = "Unknown"
+                        elif seen is None:
+                            teammate_target = "None (idle)"
+                        else:
+                            teammate_target = self._target_name(seen, self.environment.target_locations[seen], agent_index)
+                        update_message += f"TEAMMATE {idx} IS HEADING TO TARGET: {teammate_target}\n"
 
                     # Teammate message
                     if teammate.comms_quality > 0.0:
@@ -975,6 +1031,7 @@ class AgentHandler:
                     update_message += (
                         "\nAll targets have been visited. The mission is not complete until every drone is back at "
                         "its start location, and IDLE does not move you there. You should now RECALL.\n"
+        
                     )
 
         print(update_message)

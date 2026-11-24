@@ -300,7 +300,8 @@ class HybridPlanner:
     # -- planning ---------------------------------------------------------------
     def plan(self, agent_index, num_agents, targets, scene, ask_llm=None):
         """Returns ("FLY", idx) | ("IDLE", None) | ("RECALL", None).
-        ask_llm(system_prompt, user_prompt) -> parsed JSON dict or None.
+        ask_llm(system_prompt, user_prompt, silent_teammates) -> parsed JSON dict or None. The list of silent
+        teammates lets the caller constrain the reply's format to exactly those entries.
         May raise PlanningBudgetExceeded / PlanningFailed; the caller then uses fallback()."""
         rnd = scene["round"]
         if self._observed_round != rnd:
@@ -310,7 +311,7 @@ class HybridPlanner:
         if (self.cfg.use_llm and ask_llm is not None and silent
                 and not all(t.cleared for t in targets)):
             self.queries += 1
-            reply = ask_llm(BELIEF_SYSTEM_PROMPT, self._belief_prompt(targets, scene, silent, rnd))
+            reply = ask_llm(BELIEF_SYSTEM_PROMPT, self._belief_prompt(targets, scene, silent, rnd), silent)
             self._apply_llm(reply, set(silent), targets, rnd)
 
         self.last_used = dict(self.beliefs)

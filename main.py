@@ -35,6 +35,7 @@ HEADLESS = not os.environ.get("DISPLAY")
 # Batch settings; the command-line flags --runs, --seed and --parallel override these.
 NUM_RUNS = 20    # how many simulations to run
 SEED = None      # int: targets, target types and obstacles are identical in every run. None: different every run.
+SEED_FILE = None # path to a text file of integers, one per line: run i uses line i as its own scenario seed (beats SEED)
 PARALLEL = 1     # simulations running at once. Above 1 is a headless batch: no map, no recording, one process per run.
 
 # Per-drone parameter overrides applied to every drone (set by command-line flags, e.g. comms_quality)
@@ -443,25 +444,29 @@ def _run_worker(task):
         out.close()
 
 
-def run_batch(num_runs, seed, parallel, session):
+def run_batch(run_seeds, parallel, session):
+    """run_seeds: one scenario seed (or None) per run; its length is the number of runs."""
+    num_runs = len(run_seeds)
     session_dir = os.path.join(RECORD_DIR, session)
     os.makedirs(session_dir, exist_ok=True)
     parallel = max(1, min(parallel, num_runs))
     enable_osm_cache()
 
-    # One scenario in the parent: fills the OSM cache, and in a seeded batch gives every run the same
-    # optimal/rule-baseline reference, computed once instead of once per run.
-    if seed is not None:
-        random.seed(seed)
+    # One scenario in the parent fills the OSM cache. If every run uses the same seed they also share one
+    # optimal/rule-baseline reference, computed once here instead of once per run. With different seeds
+    # (or none) each run computes its own.
+    same_scenario = run_seeds[0] is not None and len(set(run_seeds)) == 1
+    if run_seeds[0] is not None:
+        random.seed(run_seeds[0])
     sim = Simulation(SCENARIO, CENTER_LAT, CENTER_LON, AREA_SIZE_M)
     sim.init_scenario()
-    if seed is not None:
+    if same_scenario:
         sim.init_handler()
         _SHARED["optimal"] = sim.find_optimal()
         _SHARED["rule"] = rule_baseline.evaluate(sim.environment, sim.handler.drone_params, trials=50)
 
-    print(f"Batch: {num_runs} runs, {parallel} at a time, seed={seed}. Output in {session_dir}")
-    tasks = [(i, seed, session_dir) for i in range(num_runs)]
+    print(f"Batch: {num_runs} runs, {parallel} at a time, seeds: {describe_seeds(run_seeds)}. Output in {session_dir}")
+    tasks = [(i, run_seeds[i], session_dir) for i in range(num_runs)]
     main_summary = agent_mod.summary_log_path
     ctx = multiprocessing.get_context("fork")        # workers inherit the OSM cache and shared results
     done = wins = 0
@@ -506,9 +511,13 @@ def agent_worker(sim, response_queue, render_done=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run drone simulations (interactive, or a headless parallel batch).")
-    parser.add_argument("--runs", type=int, default=NUM_RUNS, help="number of simulations")
-    parser.add_argument("--seed", type=int, default=SEED,
+    parser.add_argument("--runs", type=int, default=None,
+                        help=f"number of simulations (default: one per seed with --seed-file, else {NUM_RUNS})")
+    parser.add_argument("--seed", type=int, default=None,
                         help="fix targets, target types and obstacles so every run uses the same scenario")
+    parser.add_argument("--seed-file", default=None,
+                        help="text file of integers, one per line ('#' comments and blank lines allowed); "
+                             "run i uses line i as its scenario seed. Cannot be combined with --seed")
     parser.add_argument("--parallel", type=int, default=PARALLEL,
                         help="simulations to run at once; above 1 runs headless, one process per run")
     parser.add_argument("--planner", choices=["llm", "htn_llm", "hybrid"], default=None,
@@ -518,6 +527,52 @@ def parse_args():
     parser.add_argument("--comms-quality", type=_unit_interval, default=None,
                         help="chance (0-1) that a message a drone sends gets through, for every drone")
     return parser.parse_args()
+
+
+def load_seeds(path):
+    seeds = []
+    try:
+        with open(path) as f:
+            for n, line in enumerate(f, 1):
+                text = line.split("#", 1)[0].strip()
+                if not text:
+                    continue
+                try:
+                    seeds.append(int(text))
+                except ValueError:
+                    sys.exit(f"{path}, line {n}: {line.strip()!r} is not an integer")
+    except OSError as e:
+        sys.exit(f"Cannot read seed file: {e}")
+    if not seeds:
+        sys.exit(f"{path} contains no seeds")
+    return seeds
+
+
+def resolve_run_seeds(args):
+    """One scenario seed (or None) per run, from --seed-file, --seed / SEED, or nothing."""
+    seed_file = args.seed_file or SEED_FILE
+    if args.seed_file and args.seed is not None:
+        sys.exit("--seed and --seed-file cannot be used together")
+    if seed_file:
+        seeds = load_seeds(seed_file)
+        runs = args.runs if args.runs is not None else len(seeds)
+        if runs > len(seeds):
+            sys.exit(f"{seed_file} has {len(seeds)} seeds but {runs} runs were requested")
+        if runs < len(seeds):
+            print(f"NOTE: using the first {runs} of {len(seeds)} seeds in {seed_file}")
+        return seeds[:runs]
+    runs = args.runs if args.runs is not None else NUM_RUNS
+    seed = args.seed if args.seed is not None else SEED
+    return [seed] * runs
+
+
+def describe_seeds(run_seeds):
+    if run_seeds[0] is None:
+        return "none (random scenarios)"
+    if len(set(run_seeds)) == 1:
+        return f"{run_seeds[0]} (same scenario every run)"
+    shown = ", ".join(str(x) for x in run_seeds[:5])
+    return f"{len(run_seeds)} different seeds ({shown}{', ...' if len(run_seeds) > 5 else ''})"
 
 
 def _unit_interval(text):
@@ -543,14 +598,17 @@ def apply_agent_settings(args):
 if __name__ == "__main__":
     args = parse_args()
     apply_agent_settings(args)
+    run_seeds = resolve_run_seeds(args)
     session = time.strftime("%Y%m%d_%H%M%S")
     if args.parallel > 1:
         if RECORD:
             print("NOTE: RECORD is ignored in parallel mode (no map to record); each run still saves output.txt.")
-        run_batch(args.runs, args.seed, args.parallel, session)
+        run_batch(run_seeds, args.parallel, session)
         sys.exit(0)
 
-    for i in range(args.runs):
+    print(f"{len(run_seeds)} runs, seeds: {describe_seeds(run_seeds)}")
+    for i in range(len(run_seeds)):
+        run_seed = run_seeds[i]
         recorder = out_file = None
         real_out, real_err = sys.stdout, sys.stderr
         if RECORD:
@@ -567,17 +625,17 @@ if __name__ == "__main__":
             sys.stderr = Tee(real_err, out_file, lock, events_file)
 
         try:
-            if args.seed is not None:
-                random.seed(args.seed)   # the scenario (targets, types, obstacles) is generated from this
+            if run_seed is not None:
+                random.seed(run_seed)    # the scenario (targets, types, obstacles) is generated from this
             sim = Simulation(SCENARIO, CENTER_LAT, CENTER_LON, AREA_SIZE_M)
             sim.init_scenario()
             sim.init_handler()
-            sim.handler.seed = args.seed
+            sim.handler.seed = run_seed
             sim.show_map()
             optimal = sim.find_optimal()
             rule = rule_baseline.evaluate(sim.environment, sim.handler.drone_params, trials=50)
-            if args.seed is not None:
-                random.seed(f"{args.seed}:{i}")   # message loss and sensing noise: reproducible per (seed, run)
+            if run_seed is not None:
+                random.seed(f"{run_seed}:{i}")    # message loss and sensing noise: reproducible per (seed, run)
 
             response_queue = queue.Queue()
             render_done = threading.Event() if RECORD else None
